@@ -1,0 +1,331 @@
+---
+title: '''SEQUENTIAL TRAINING UPDATES - LM MODELS'''
+author: "Stanley Sayianka"
+date: "3/13/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Now we turn to linear regression to experiment our model, 
+Here i will use the real estate dataset, which contains prices of houses, together with other variables, which we'd like to know whether they affect the price of the house, e.g. the house age, distance to nearest M.R.T station, latitude, longitude(and probably altitude).
+
+I will not display the initial visualizations, and the data preprocessing that much, so that we could just go straight to the point.
+
+## LOADING DATA
+```{R data}
+# directory
+setwd("C:/Users/stanley/Desktop/MISCELLANEOUS R/ml projects/regression/real estate regression analysis")
+
+# libraries
+require(pacman)
+p_load(readxl, dplyr, ggplot2, magrittr, 
+       plotly, gganimate, ModelMetrics, stringr, 
+       raster, sp)
+
+# data
+dd <- read_excel("Real estate valuation full data.xlsx", sheet=1) %>%
+  as.data.frame()
+
+head(dd)
+glimpse(dd)
+```
+
+I thought it would seem great to fetch altitude data, in order to see whether altitude of a place affects the house prices therein, because latitude and longitude really have no meaning when looking for houses(unless of course the equator)
+
+```{r get alt}
+# generating altitude data ------------------------------------------------
+
+altitude_data <- dplyr::select(dd, `X6 longitude`, `X5 latitude`)
+altitude_data <- data.frame(cbind(dd$`X6 longitude`, dd$`X5 latitude`))
+
+names(altitude_data) <- c("lon", "lat")
+
+# using raster
+x <- getData('alt', country = "TW")
+
+full_alt <- cbind(altitude_data, alt = extract(x, altitude_data))
+
+
+alt_dd <- cbind(dd, full_alt$alt)
+names(alt_dd) <- c(names(dd), "altitude")
+```
+
+
+Now, i can try fitting the regression model, as shown below:
+I will omit all the models i tried fitting, and just show you the best model i came up with(You can't believe altitude was insignificant to the house prices !).
+
+```{r model}
+# start of model analysis -------------------------------------------------
+
+# selecting variables of interest
+newdd <- dplyr::select(dd, 
+                `X2 house age`,
+                `X3 distance to the nearest MRT station`,
+                `X4 number of convenience stores`,
+                `X5 latitude`,`X6 longitude`,
+                `Y house price of unit area`)
+
+# splitting data into test and train
+
+# just choosing sequentially
+newdd_train <- newdd[1:314, ]
+newdd_test <- newdd[315:414, ]
+
+# fitting linear regression model
+hlm2 <- lm(`Y house price of unit area`~
+             `X2 house age`+`X3 distance to the nearest MRT station`+
+             `X4 number of convenience stores`+`X5 latitude`, data=newdd_train)
+summary(hlm2)
+```
+The adjusted R squared, is so low, around 0.56, but i will try improving it as you will see by removing outliers and high leverage points.
+
+Omitting high leverage points and outliers, i get:
+
+```{r omit outlev}
+
+# outlier removal function ------------------------------------------------
+
+outliers_fn <- function(model, d_f, deviations=c(NULL))
+{
+  deviations <- ifelse(is.null(deviations) == T,
+                       yes = 3,
+                       no = deviations)
+  require(magrittr)
+  message(paste("Using deviation :", deviations))
+  
+  # we normally consider outliers being 3 stdevs away from mean
+  model_table <- data.frame(cbind(model$fitted.values,
+                                  rstudent(model))) %>%
+    filter(
+      X2 > deviations | X2 < (-deviations)
+    )
+  outliers <- rownames(model_table) %>% as.integer()
+  
+  remout_model <- update(model, data = d_f[-outliers, ])
+  return(remout_model)
+}
+
+
+# high leverage points removal --------------------------------------------
+
+
+remout <- outliers_fn(model = hlm2, d_f = newdd_train)
+```
+
+```{r improvedmodel}
+summary(remout)
+```
+The adjusted R squared raises to 0.67, which is quite impressive, i can now use this updated model(i removed the outliers), to predict the test dataset.
+
+```{r pred}
+library(ModelMetrics)
+
+# predicting test data
+lm_pred <- predict.lm(remout, newdd_test, type = "response")
+
+# obtaining MSE
+mse(lm_pred, newdd_test$`Y house price of unit area`)
+```
+
+The MSE recorded is 60.86265.
+
+To improve this score further, i will use "noise adding" to improve it.
+Noise adding is simply:
+For a new test input x, we use the linear regression model to predict its y value, and then for every y value predicted, I will add an error term which is obtained by averaging the error terms(residuals) of the nearest neighbor of our new x instance. Remember the nearest neighbors of the test instance are all obtained from the training set that was used to fit the linear regression model.
+
+```{R COMINEKNNLM, echo=F, include=F}
+combine_knnlm<-function(train, test, train_labs, k)
+{
+  require(compiler)
+  # train - train dataset
+  # test - test dataset
+  # train_labs - train labels(continuous labels for regression)
+  # k - the number of nearest neighbours
+  
+  if (ncol(train)!=ncol(test))
+  {
+    stop("Number of columns for both train and test dataset should be equal")
+  }
+  
+  else
+  {
+    
+    dhfn<-function(x,y)
+    { ## distance holder function
+      #x,y are MATRICES
+      #x-test data
+      #y-train data
+      z<-data.frame()
+      x<-as.matrix(x)
+      y<-as.matrix(y)
+      for (i in 1:nrow(x))
+      {
+        for (j in 1:nrow(y))
+        {
+          z[j,i]<-sqrt(sum((x[i, ]-y[j, ])**2)) # euclidean dist
+        }
+      }
+      return(z)
+    }
+    # speeding up with compiler library
+    cmpdhfn <- cmpfun(dhfn)
+    
+    distance_holder<-data.frame()
+    # a dataframe to hold distances, col-test, row-train
+    # the columns in distance holder are the test rows
+    # the row names in distance holder are the train rows
+    distance_holder<-cmpdhfn(test,train)
+    
+    # a list to hold the orders of distances
+    distance_list<-list()
+    
+    # a list to hold the nearest labels
+    labels_holder<-list()
+    cls <- vector()
+    
+    for (i in 1:ncol(distance_holder))
+    {
+      distance_list[[i]]<-order(distance_holder[, i])[1:k]
+    }
+  }
+  
+  return(distance_list)
+}
+
+```
+
+```{r noise added}
+
+# capturing MSEs from a range of k values
+var_mse <- vector()
+
+for (kval in 1:15)
+{
+  message(paste("Training using k: ", kval))
+  nn_lm <- combine_knnlm(train=newdd_train[,-6], test=newdd_test[,-6], 
+                         train_labs = newdd_train[,6], k=kval)
+  
+  final_pred <- vector()
+  res_knnlm <- vector()
+  for (i in 1:length(nn_lm))
+  {
+    res_knnlm[i] <- mean((hlm2$residuals)[nn_lm[[i]]], na.rm=T)
+  }
+  final_pred <- lm_pred + res_knnlm
+  
+  var_mse[kval] <- mse(newdd_test$`Y house price of unit area`, 
+                       final_pred)
+}
+plot(var_mse, type="o",
+     col="maroon", pch=20, xlab="K value", ylab="Mean square error",
+     ylim=c(40, 65),
+     main="MEAN SQUARE ERROR OF MODELS", sub = "The blue line is the baseline MSE")
+abline(h=mse(newdd_test$`Y house price of unit area`, 
+           lm_pred), col="blue")
+text(x = 10,y = mse(newdd_test$`Y house price of unit area`, 
+                    lm_pred), labels = "The baseline MSE", col = "blue", 
+     pos = 3)
+axis(1, at=1:15)
+```
+The MSE's observed even come as low as 49
+
+## THE SEQUENTIAL TRAINING UPDATES MODEL
+
+Now, it would not be wise if we just follow the following steps below.
+
+1. Use the trainind data, to fit a regression model
+
+2. Use the model to predict the first test instance
+
+3. Add the predicted test instance to the training data
+
+4. Update the model with the new updated training dataset.
+
+This is because , (assume the case of simple linear regression), predicted values are the values that literally lie on the regression line. Therefore, even if we predicted a test instance and added it to the training data, and then used the new training data to refit the model, NOTHING will change in the way the model behaves since, the predicted value from the test instance lies on the line, therefore even refitting the model, will produce the exact same model !
+
+To counter this problem, i choose to follow the following steps.
+
+1. Use the trainind data, to fit a regression model
+
+2. Use the model to predict the first test instance
+
+3. Add some "noise" to the predicted output
+
+3. Add the "noise added" predicted test instance to the training data
+
+4. Update the model with the new updated training dataset.
+
+The noise i add to the predicted test instances, is noise obtained from the nearest neighbours of the test instance averaged.(This method is so efficient, i have been using it to improve MSE scores).
+
+The following function below tackles that
+
+
+
+```{r addnoisewhileaddtotrain}
+
+# additive lm models with noise addition
+
+additive_lm <- function(formulae, train, test)
+{
+  # hold test results
+  temp <- vector()
+  
+  for (i in 1:nrow(test))
+  {
+    print(paste("Total Training instances now are: ", nrow(train)))
+    
+    # the model
+    regmod <- lm(formula = formulae, data=train)
+    
+    message(paste("Model fitting test instance: ",i))
+    temp[i] <- predict.lm(regmod, test[i,], type = "response")
+    
+    # adding noise to predicted test instance
+    nn_lm <- combine_knnlm(train = train[, -6],
+                           test = test[i, ],
+                           train_labs = train[, 6],
+                           k=7) %>%
+      unlist()
+    
+    #print("check nn_lm")
+    #message(nn_lm)
+    
+    res_knnlm <- mean((regmod$residuals)[nn_lm], na.rm=T)
+    w_noise <- temp[i] + res_knnlm
+    #print(w_noise)
+    
+    #print("check end noise adds")
+    
+    temp[i] <- w_noise
+    rm(w_noise)
+    
+    # continuation
+    temp_testrow <- c(test[i, ], temp[i])
+    names(temp_testrow) <- names(train)
+    
+    train <- rbind(train, temp_testrow)
+    rm(temp_testrow)
+  }
+  return(temp)
+}
+```
+
+Trying this function on the data:
+```{r try}
+# trying it on real estate dataset
+addnoise <- additive_lm(formulae = `Y house price of unit area`~
+                          `X2 house age`+`X3 distance to the nearest MRT station`+
+                          `X4 number of convenience stores`+`X5 latitude`, train = newdd_train, test = newdd_test[100:1, -6])
+
+mse(addnoise, newdd_test[100:1, 6])
+```
+
+The mean squared error obtained is 53
+
+I expected that by adding more data while training, there would be higher chances of improving prediction accuracy, which is not the case !
+
+Or is something wrong with my analysis ?
+Thanks a lot.
